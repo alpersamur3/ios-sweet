@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/SweetAppleSurface.cpp b/iokit/Kernel/arm/SweetAppleSurface.cpp
 new file mode 100755
-index 0000000..095055e
+index 0000000..e83f5e1
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAppleSurface.cpp
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,228 @@
 +/*
 + * Kernel-side access to Apple's IOSurface kext (see SweetAppleSurface.h).
 + *
@@ -25,6 +25,7 @@ index 0000000..095055e
 +
 +#if defined(SWEET) && SWEET_APPLE_IOSURFACE
 +#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <libkern/c++/OSDictionary.h>
 +#include <libkern/c++/OSNumber.h>
@@ -74,6 +75,25 @@ index 0000000..095055e
 +		}
 +	}
 +	return sweet_isurf_root() != NULL;
++}
++
++#define SWEET_ISURF_ROOT_NAME   "IOCoreSurfaceRoot"
++
++void
++sweet_apple_surface_publish_name(void)
++{
++	static unsigned logged;
++
++	if (!sweet_apple_surface_ready()) {
++		return;
++	}
++	IOService *root = (IOService *)sweet_isurf_root();
++	if (strcmp(root->getName(), SWEET_ISURF_ROOT_NAME) != 0) {
++		root->setName(SWEET_ISURF_ROOT_NAME);
++		if (logged++ < 8) {
++			IOLog("SWEET FB: IOSurfaceRoot named %s\n", root->getName());
++		}
++	}
 +}
 +
 +#define SWEET_ISURF_MAPS        8
@@ -214,10 +234,10 @@ index 0000000..095055e
 +#endif /* SWEET && SWEET_APPLE_IOSURFACE */
 diff --git a/iokit/Kernel/arm/SweetAppleSurface.h b/iokit/Kernel/arm/SweetAppleSurface.h
 new file mode 100755
-index 0000000..211c3e2
+index 0000000..b9b4412
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAppleSurface.h
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,90 @@
 +/*
 + * Kernel-side access to Apple's IOSurface kext (SWEET_APPLE_IOSURFACE 1).
 + *
@@ -290,6 +310,14 @@ index 0000000..211c3e2
 +/* The kext is bound (prelinked) and its root service is up. */
 +bool sweet_apple_surface_ready(void);
 +
++/*
++ * Name the kext's IOSurfaceRoot "IOCoreSurfaceRoot", the name iOS 16's
++ * IOSurface.framework looks it up by (IOServiceNameMatching). The kext ends
++ * IOSurfaceRoot::start with setName("IOSurfaceRoot"), so this is called from
++ * AppleCLCD's vsync tick and sets the name again whenever it is not right.
++ */
++void sweet_apple_surface_publish_name(void);
++
 +/* Retained look-up of a surface id on behalf of `task` (the task whose client created it). */
 +bool sweet_apple_surface_lookup(uint32_t id, task_t task, struct SweetAppleSurface *out);
 +void sweet_apple_surface_put(struct SweetAppleSurface *s);
@@ -301,7 +329,7 @@ index 0000000..211c3e2
 +#endif /* SWEET && SWEET_APPLE_IOSURFACE */
 +#endif /* _SWEET_APPLE_SURFACE_H */
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index d301a13..2066471 100644
+index d301a13..35fbf07 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -30,11 +30,16 @@
@@ -382,7 +410,17 @@ index d301a13..2066471 100644
  	return true;
  }
  
-@@ -250,16 +274,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -218,6 +242,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++#if SWEET_APPLE_IOSURFACE
++	sweet_apple_surface_publish_name();
++#endif
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -250,16 +277,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
  	uint8_t *rec = NULL;
@@ -402,7 +440,7 @@ index d301a13..2066471 100644
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -292,6 +318,15 @@ get32(const uint8_t *p, uint32_t off)
+@@ -292,6 +321,15 @@ get32(const uint8_t *p, uint32_t off)
  	return v;
  }
  
@@ -418,7 +456,7 @@ index d301a13..2066471 100644
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
-@@ -303,10 +338,11 @@ static uint64_t sweet_fb_swap_count;
+@@ -303,10 +341,11 @@ static uint64_t sweet_fb_swap_count;
   * default 10 Hz).
   */
  void
@@ -431,7 +469,7 @@ index d301a13..2066471 100644
  	fDirty = true;
  	IOLockUnlock(fLock);
  	if ((++sweet_fb_swap_count % 1000) == 0) {
-@@ -315,7 +351,7 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -315,7 +354,7 @@ AppleCLCD::swap(const uint8_t *rec)
  }
  
  void
@@ -440,7 +478,7 @@ index d301a13..2066471 100644
  {
  	uint32_t mask = get32(rec, 0x104);
  
-@@ -341,23 +377,64 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -341,23 +380,64 @@ AppleCLCD::present(const uint8_t *rec)
  		if (!(mask & (1u << layer)) || id == 0) {
  			continue;
  		}
@@ -512,7 +550,7 @@ index d301a13..2066471 100644
  		}
  		if (sx < 0 || sy < 0) {
  			sx = sy = 0;
-@@ -378,11 +455,11 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -378,11 +458,11 @@ AppleCLCD::present(const uint8_t *rec)
  			h += dy;
  			dy = 0;
  		}
@@ -528,7 +566,7 @@ index d301a13..2066471 100644
  		}
  		if (w > (int32_t)fWidth - dx) {
  			w = (int32_t)fWidth - dx;
-@@ -390,20 +467,24 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -390,20 +470,24 @@ AppleCLCD::present(const uint8_t *rec)
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -557,7 +595,7 @@ index d301a13..2066471 100644
  	}
  }
  
-@@ -488,8 +569,21 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -488,8 +572,21 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  
  	switch (selector) {
  	case kSweetFBGetLayerDefaultSurface:
@@ -579,7 +617,7 @@ index d301a13..2066471 100644
  		break;
  	case kSweetFBSwapBegin:
  		IOLockLock(fFB->fLock);
-@@ -505,7 +599,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -505,7 +602,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			break;
  		}
  		memcpy(rec, args->structureInput, sizeof(rec));
