@@ -1,0 +1,684 @@
+diff --git a/iokit/Kernel/arm/SweetAppleSurface.cpp b/iokit/Kernel/arm/SweetAppleSurface.cpp
+new file mode 100755
+index 0000000..095055e
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAppleSurface.cpp
+@@ -0,0 +1,208 @@
++/*
++ * Kernel-side access to Apple's IOSurface kext (see SweetAppleSurface.h).
++ *
++ * AppleCLCD (SweetFramebuffer.cpp) needs three things from the surface root:
++ * the pixels behind a surface id (a swap names surfaces by id), a surface
++ * for GetLayerDefaultSurface, and a send right to that surface in the
++ * caller's task. The kext does all three; this file calls its functions
++ * through the table the prelinker fills in. Without that table (a kernel
++ * that was not prelinked with the kext) every call fails cleanly.
++ *
++ * Look-ups are made on behalf of the task that owns the framebuffer user
++ * client (backboardd): the kext only hands a surface to a task whose client
++ * knows it, and backboardd created or looked up every surface it swaps.
++ *
++ * sweet_apple_surface_lookup() keeps a small cache of kernel mappings and is
++ * only called from AppleCLCD's work loop thread.
++ */
++#include "SweetAppleSurface.h"
++
++#if defined(SWEET) && SWEET_APPLE_IOSURFACE
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSObject.h>
++
++extern "C" {
++/* Not static: tools/prelink.py finds it by name in the kernel's symbol table. */
++struct sweet_isurf_hooks sweet_isurf_hooks __attribute__((used)) = {
++	SWEET_ISURF_MAGIC, kSweetISurfCount, 0, { NULL }
++};
++}
++
++typedef void *(*isurf_root_fn)(void);
++typedef void *(*isurf_lookup_fn)(void *root, uint32_t id, task_t task);
++typedef void *(*isurf_create_fn)(void *root, task_t task, OSDictionary *props);
++typedef int (*isurf_copyport_fn)(void *root, task_t task, void *surface, uint32_t *name);
++typedef void *(*isurf_memory_fn)(void *surface, void *service);
++typedef uint32_t (*isurf_get_fn)(void *surface);
++
++static inline void *
++sweet_isurf_hook(unsigned i)
++{
++	return ((void *volatile *)sweet_isurf_hooks.fn)[i];
++}
++
++static uint32_t
++sweet_isurf_get(unsigned i, void *surface)
++{
++	return ((isurf_get_fn)sweet_isurf_hook(i))(surface);
++}
++
++static void *
++sweet_isurf_root(void)
++{
++	return ((isurf_root_fn)sweet_isurf_hook(kSweetISurfRoot))();
++}
++
++bool
++sweet_apple_surface_ready(void)
++{
++	if (sweet_isurf_hooks.magic != SWEET_ISURF_MAGIC) {
++		return false;
++	}
++	for (unsigned i = 0; i < kSweetISurfCount; i++) {
++		if (sweet_isurf_hook(i) == NULL) {
++			return false;
++		}
++	}
++	return sweet_isurf_root() != NULL;
++}
++
++#define SWEET_ISURF_MAPS        8
++
++static struct {
++	IOMemoryDescriptor *md;         /* retained: the key must not be recycled */
++	IOMemoryMap        *map;
++} sweet_isurf_maps[SWEET_ISURF_MAPS];
++static unsigned sweet_isurf_map_next;
++
++/* Kernel address of the memory's first byte, or 0. */
++static uintptr_t
++sweet_isurf_map(IOMemoryDescriptor *md)
++{
++	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, md);
++	if (buffer != NULL) {
++		return (uintptr_t)buffer->getBytesNoCopy();
++	}
++	for (unsigned i = 0; i < SWEET_ISURF_MAPS; i++) {
++		if (sweet_isurf_maps[i].md == md) {
++			return (uintptr_t)sweet_isurf_maps[i].map->getVirtualAddress();
++		}
++	}
++	IOMemoryMap *map = md->map(kIOMapDefaultCache);
++	if (map == NULL) {
++		return 0;
++	}
++	unsigned slot = sweet_isurf_map_next++ % SWEET_ISURF_MAPS;
++	OSSafeReleaseNULL(sweet_isurf_maps[slot].map);
++	OSSafeReleaseNULL(sweet_isurf_maps[slot].md);
++	md->retain();
++	sweet_isurf_maps[slot].md = md;
++	sweet_isurf_maps[slot].map = map;
++	return (uintptr_t)map->getVirtualAddress();
++}
++
++bool
++sweet_apple_surface_lookup(uint32_t id, task_t task, struct SweetAppleSurface *out)
++{
++	bzero(out, sizeof(*out));
++	if (!sweet_apple_surface_ready()) {
++		return false;
++	}
++	void *s = ((isurf_lookup_fn)sweet_isurf_hook(kSweetISurfLookup))(sweet_isurf_root(), id, task);
++	if (s == NULL) {
++		return false;
++	}
++	out->surface = s;
++	out->id = id;
++	out->width = sweet_isurf_get(kSweetISurfWidth, s);
++	out->height = sweet_isurf_get(kSweetISurfHeight, s);
++	out->bytesPerRow = sweet_isurf_get(kSweetISurfBytesPerRow, s);
++	out->bytesPerElement = sweet_isurf_get(kSweetISurfBytesPerElement, s) & 0xffff;
++	out->pixelFormat = sweet_isurf_get(kSweetISurfPixelFormat, s);
++	out->elementWidth = (uint8_t)sweet_isurf_get(kSweetISurfElementWidth, s);
++	out->elementHeight = (uint8_t)sweet_isurf_get(kSweetISurfElementHeight, s);
++	out->baseOffset = sweet_isurf_get(kSweetISurfBaseOffset, s);
++	out->allocOffset = sweet_isurf_get(kSweetISurfAllocOffset, s);
++	out->allocSize = sweet_isurf_get(kSweetISurfAllocSize, s);
++	out->planes = sweet_isurf_get(kSweetISurfPlanes, s);
++	out->memory = (IOMemoryDescriptor *)((isurf_memory_fn)sweet_isurf_hook(kSweetISurfMemory))(s, NULL);
++	if (out->memory != NULL) {
++		uint64_t skip = (uint64_t)out->allocOffset + out->baseOffset;
++		uint64_t len = out->memory->getLength();
++		uintptr_t base = sweet_isurf_map(out->memory);
++		out->length = len > skip ? len - skip : 0;
++		out->pixels = (base != 0 && len > skip) ? base + (uintptr_t)skip : 0;
++	}
++	return true;
++}
++
++void
++sweet_apple_surface_put(struct SweetAppleSurface *s)
++{
++	if (s->surface != NULL) {
++		((OSObject *)s->surface)->release();
++		s->surface = NULL;
++	}
++}
++
++static void
++sweet_isurf_dict_u32(OSDictionary *dict, const char *key, uint32_t value)
++{
++	OSNumber *n = OSNumber::withNumber(value, 32);
++	if (n != NULL) {
++		dict->setObject(key, n);
++		n->release();
++	}
++}
++
++bool
++sweet_apple_surface_create_port(task_t task, uint32_t width, uint32_t height,
++    uint32_t pixelFormat, uint32_t *portName, uint32_t *surfaceID)
++{
++	if (!sweet_apple_surface_ready()) {
++		return false;
++	}
++	void *root = sweet_isurf_root();
++	uint32_t bpr = (width * 4 + 63) & ~63u;
++	OSDictionary *props = OSDictionary::withCapacity(8);
++	if (props == NULL) {
++		return false;
++	}
++	sweet_isurf_dict_u32(props, "IOSurfaceWidth", width);
++	sweet_isurf_dict_u32(props, "IOSurfaceHeight", height);
++	sweet_isurf_dict_u32(props, "IOSurfaceBytesPerElement", 4);
++	sweet_isurf_dict_u32(props, "IOSurfaceElementWidth", 1);
++	sweet_isurf_dict_u32(props, "IOSurfaceElementHeight", 1);
++	sweet_isurf_dict_u32(props, "IOSurfacePixelFormat", pixelFormat);
++	sweet_isurf_dict_u32(props, "IOSurfaceBytesPerRow", bpr);
++	sweet_isurf_dict_u32(props, "IOSurfaceAllocSize", (uint32_t)round_page((uint64_t)bpr * height));
++	void *s = ((isurf_create_fn)sweet_isurf_hook(kSweetISurfCreate))(root, task, props);
++	props->release();
++	if (s == NULL) {
++		IOLog("SWEET FB: IOSurfaceRoot::createSurface(%ux%u) failed\n", width, height);
++		return false;
++	}
++	uint32_t name = 0;
++	int ret = ((isurf_copyport_fn)sweet_isurf_hook(kSweetISurfCopyPort))(root, task, s, &name);
++	*surfaceID = sweet_isurf_get(kSweetISurfID, s);
++	/*
++	 * Drop our reference only when something else (the send right) holds
++	 * the surface too: whether createSurface hands back an owned reference
++	 * was not read off the kext, and a leak of one surface is the safe side.
++	 */
++	int rc = ((OSObject *)s)->getRetainCount();
++	IOLog("SWEET FB: default surface %u created, retain count %d, port 0x%x -> 0x%x\n",
++	    *surfaceID, rc, name, ret);
++	if (rc > 1) {
++		((OSObject *)s)->release();
++	}
++	if (ret != 0 || name == 0) {
++		return false;
++	}
++	*portName = name;
++	return true;
++}
++#endif /* SWEET && SWEET_APPLE_IOSURFACE */
+diff --git a/iokit/Kernel/arm/SweetAppleSurface.h b/iokit/Kernel/arm/SweetAppleSurface.h
+new file mode 100755
+index 0000000..211c3e2
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAppleSurface.h
+@@ -0,0 +1,82 @@
++/*
++ * Kernel-side access to Apple's IOSurface kext (SWEET_APPLE_IOSURFACE 1).
++ *
++ * The kext is prelinked into the kernel image after the kernel was linked,
++ * so the kernel cannot name its functions. tools/prelink.py (--hooks) writes
++ * their addresses into sweet_isurf_hooks.fn[] in the image instead, in the
++ * order of the enum below (it checks magic and count first). Every entry is
++ * a plain C++ member function of the kext's IOSurfaceRoot / IOSurface,
++ * called with `this` as the first argument (Itanium arm64 ABI).
++ *
++ * The kext functions, by index:
++ *   kSweetISurfRoot       IOSurfaceRoot::root()
++ *   kSweetISurfLookup     IOSurfaceRoot::lookupSurface(unsigned, task*)      retained
++ *   kSweetISurfCreate     IOSurfaceRoot::createSurface(task*, OSDictionary*) retained
++ *   kSweetISurfCopyPort   IOSurfaceRoot::copyPortNameForSurfaceInTask(task*, IOSurface*, unsigned*)
++ *   kSweetISurfMemory     IOSurface::getMemoryDescriptor(IOService*)
++ *   kSweetISurfID .. kSweetISurfPlanes   IOSurface::get*() const
++ */
++#ifndef _SWEET_APPLE_SURFACE_H
++#define _SWEET_APPLE_SURFACE_H
++
++#include "SweetSurfaceMode.h"
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET) && SWEET_APPLE_IOSURFACE
++#include <IOKit/IOMemoryDescriptor.h>
++#include <mach/mach_types.h>
++
++enum {
++	kSweetISurfRoot,
++	kSweetISurfLookup,
++	kSweetISurfCreate,
++	kSweetISurfCopyPort,
++	kSweetISurfMemory,
++	kSweetISurfID,
++	kSweetISurfWidth,
++	kSweetISurfHeight,
++	kSweetISurfBytesPerRow,
++	kSweetISurfPixelFormat,
++	kSweetISurfBytesPerElement,
++	kSweetISurfElementWidth,
++	kSweetISurfElementHeight,
++	kSweetISurfBaseOffset,
++	kSweetISurfAllocOffset,
++	kSweetISurfAllocSize,
++	kSweetISurfPlanes,
++	kSweetISurfCount
++};
++
++#define SWEET_ISURF_MAGIC       0x53575f4953524600ULL   /* "SW_ISRF\0" */
++
++struct sweet_isurf_hooks {
++	uint64_t magic;
++	uint32_t count;
++	uint32_t bound;                 /* set by the prelinker once fn[] is filled */
++	void    *fn[kSweetISurfCount];
++};
++
++/* A surface as the display driver reads it. Filled by sweet_apple_surface_lookup. */
++struct SweetAppleSurface {
++	void               *surface;    /* IOSurface*, retained; NULL when empty */
++	uint32_t            id, width, height, bytesPerRow, bytesPerElement;
++	uint32_t            baseOffset, allocOffset, allocSize, planes, pixelFormat;
++	uint8_t             elementWidth, elementHeight;
++	IOMemoryDescriptor *memory;     /* owned by the surface */
++	uint64_t            length;     /* memory->getLength() */
++	uintptr_t           pixels;     /* kernel address of the first pixel, 0 if unmapped */
++};
++
++/* The kext is bound (prelinked) and its root service is up. */
++bool sweet_apple_surface_ready(void);
++
++/* Retained look-up of a surface id on behalf of `task` (the task whose client created it). */
++bool sweet_apple_surface_lookup(uint32_t id, task_t task, struct SweetAppleSurface *out);
++void sweet_apple_surface_put(struct SweetAppleSurface *s);
++
++/* A fresh BGRA surface owned by `task` and a send right to it in `task`. */
++bool sweet_apple_surface_create_port(task_t task, uint32_t width, uint32_t height,
++    uint32_t pixelFormat, uint32_t *portName, uint32_t *surfaceID);
++
++#endif /* SWEET && SWEET_APPLE_IOSURFACE */
++#endif /* _SWEET_APPLE_SURFACE_H */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d301a13..2066471 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -30,11 +30,16 @@
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+- * default framebuffer surface. The kernel text console keeps drawing over
++ * default framebuffer surface. With SWEET_APPLE_IOSURFACE (SweetSurfaceMode.h)
++ * the surfaces belong to Apple's IOSurface kext instead: swaps are read
++ * through SweetAppleSurface.cpp on behalf of the client's task, the panel
++ * memory is mapped here, and the default surface is a new Apple surface.
++ * The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "SweetSurface.h"
++#include "SweetAppleSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_vinput_display_power(int on);    /* bsd/dev/sweet_vinput.c */
+@@ -107,7 +112,12 @@ public:
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
++#if !SWEET_APPLE_IOSURFACE
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
++#else
++	IOMemoryDescriptor *fPanelMem;  /* the panel memory (physical range) */
++#endif
++	task_t        fPendingTask;     /* task of the client that made the latest swap */
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+@@ -122,8 +132,8 @@ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+-	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	void swap(const uint8_t *rec, task_t task);
++	void present(const uint8_t *rec, task_t task);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -180,12 +190,26 @@ AppleCLCD::start(IOService *provider)
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
++#if !SWEET_APPLE_IOSURFACE
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	uint32_t defaultID = fSurface != NULL ? fSurface->id : 0;
++#else
++	fPanelMem = IOMemoryDescriptor::withPhysicalAddress(fPhys,
++	    round_page((uint64_t)fRowBytes * fHeight), kIODirectionInOut);
++	fMap = fPanelMem != NULL ? fPanelMem->map(kIOMapWriteCombineCache) : NULL;
++	fPixels = fMap != NULL ? (uintptr_t)fMap->getVirtualAddress() : 0;
++	uint32_t defaultID = 0;         /* a new Apple surface per GetLayerDefaultSurface */
++#endif
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
++#if !SWEET_APPLE_IOSURFACE
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
++#else
++		OSSafeReleaseNULL(fMap);
++		OSSafeReleaseNULL(fPanelMem);
++#endif
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
+@@ -208,7 +232,7 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	    fWidth, fHeight, fRowBytes, fPhys, defaultID, fLogicalW, fLogicalH);
+ 	return true;
+ }
+ 
+@@ -250,16 +274,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
++	task_t task = TASK_NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			task = fb->fPendingTask;
+ 			fb->fDirty = false;
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+-		fb->present(rec);
++		fb->present(rec, task);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -292,6 +318,15 @@ get32(const uint8_t *p, uint32_t off)
+ 	return v;
+ }
+ 
++/* A swap layer's surface as present() copies it, whoever owns the surface. */
++struct sweet_fb_src {
++	uint32_t  width, height, bytesPerRow, offset, bytesPerElement, pixelFormat;
++	uint8_t   elementWidth, elementHeight;
++	uintptr_t base;         /* kernel address of the surface memory */
++	uint64_t  length;       /* bytes at base (pixels start at base + offset) */
++	bool      found;
++};
++
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+@@ -303,10 +338,11 @@ static uint64_t sweet_fb_swap_count;
+  * default 10 Hz).
+  */
+ void
+-AppleCLCD::swap(const uint8_t *rec)
++AppleCLCD::swap(const uint8_t *rec, task_t task)
+ {
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fPendingTask = task;
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+@@ -315,7 +351,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ }
+ 
+ void
+-AppleCLCD::present(const uint8_t *rec)
++AppleCLCD::present(const uint8_t *rec, task_t task)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
+@@ -341,23 +377,64 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (!(mask & (1u << layer)) || id == 0) {
+ 			continue;
+ 		}
++		struct sweet_fb_src f;
++		bzero(&f, sizeof(f));
++#if !SWEET_APPLE_IOSURFACE
+ 		SweetSurface *s = sweet_surface_copy(id);
++		if (s != NULL && s != fSurface) {
++			f.width = s->width;
++			f.height = s->height;
++			f.bytesPerRow = s->bytesPerRow;
++			f.offset = s->offset;
++			f.bytesPerElement = s->bytesPerElement;
++			f.pixelFormat = s->pixelFormat;
++			f.elementWidth = s->elementWidth;
++			f.elementHeight = s->elementHeight;
++			f.base = s->kernelAddress();
++			f.length = s->memory != NULL ? s->memory->getLength() : 0;
++			f.found = true;
++		}
++#else
++		struct SweetAppleSurface as;
++		if (sweet_apple_surface_lookup(id, task, &as)) {
++			f.width = as.width;
++			f.height = as.height;
++			f.bytesPerRow = as.bytesPerRow;
++			f.offset = 0;
++			f.bytesPerElement = as.bytesPerElement;
++			f.pixelFormat = as.pixelFormat;
++			f.elementWidth = as.elementWidth;
++			f.elementHeight = as.elementHeight;
++			f.base = as.pixels;
++			f.length = as.length;
++			f.found = as.planes == 0;       /* a plain RGB surface */
++		}
++#endif
+ 		if (sweet_fb_swaps_logged < 16) {
+ 			sweet_fb_swaps_logged++;
+ 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+-			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
+-			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
++			    get32(rec, 0x50), layer, id, f.width, f.height,
++			    f.pixelFormat, f.bytesPerRow, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
++#if SWEET_APPLE_IOSURFACE
++			IOLog("SWEET FB: surface %u task %p: found %d bpe %u planes %u base 0x%lx off %u+%u alloc %u len %llu\n",
++			    id, task, as.surface != NULL, as.bytesPerElement, as.planes, (unsigned long)as.pixels,
++			    as.allocOffset, as.baseOffset, as.allocSize, as.length);
++#endif
+ 		}
+-		if (s == NULL || s == fSurface) {
++		if (!f.found) {
++#if !SWEET_APPLE_IOSURFACE
+ 			OSSafeReleaseNULL(s);
++#else
++			sweet_apple_surface_put(&as);
++#endif
+ 			continue;
+ 		}
+-		uintptr_t src = s->kernelAddress();
+-		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		uintptr_t src = f.base;
++		uint32_t bpe = f.bytesPerElement ? f.bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+-			w = (int32_t)s->width;
+-			h = (int32_t)s->height;
++			w = (int32_t)f.width;
++			h = (int32_t)f.height;
+ 		}
+ 		if (sx < 0 || sy < 0) {
+ 			sx = sy = 0;
+@@ -378,11 +455,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 			h += dy;
+ 			dy = 0;
+ 		}
+-		if (w > (int32_t)s->width - sx) {
+-			w = (int32_t)s->width - sx;
++		if (w > (int32_t)f.width - sx) {
++			w = (int32_t)f.width - sx;
+ 		}
+-		if (h > (int32_t)s->height - sy) {
+-			h = (int32_t)s->height - sy;
++		if (h > (int32_t)f.height - sy) {
++			h = (int32_t)f.height - sy;
+ 		}
+ 		if (w > (int32_t)fWidth - dx) {
+ 			w = (int32_t)fWidth - dx;
+@@ -390,20 +467,24 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (h > (int32_t)fHeight - dy) {
+ 			h = (int32_t)fHeight - dy;
+ 		}
+-		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++		uint64_t last = (uint64_t)f.offset + (uint64_t)(sy + h - 1) * f.bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+-		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+-		    s->memory == NULL || last > s->memory->getLength()) {
++		if (w <= 0 || h <= 0 || f.elementWidth != 1 || f.elementHeight != 1 ||
++		    f.length == 0 || last > f.length) {
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++				    (const void *)(src + f.offset + (uint64_t)(sy + y) * f.bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
+ 		}
++#if !SWEET_APPLE_IOSURFACE
+ 		s->release();
++#else
++		sweet_apple_surface_put(&as);
++#endif
+ 	}
+ }
+ 
+@@ -488,8 +569,21 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:
++#if !SWEET_APPLE_IOSURFACE
+ 		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
+ 		outCount = 1;
++#else
++		{
++			uint32_t port = 0, sid = 0;
++			if (sweet_apple_surface_create_port(fTask, fFB->fWidth, fFB->fHeight,
++			    SWEET_FB_FORMAT_BGRA, &port, &sid)) {
++				out[0] = port;
++				outCount = 1;
++			} else {
++				ret = kIOReturnNotReady;
++			}
++		}
++#endif
+ 		break;
+ 	case kSweetFBSwapBegin:
+ 		IOLockLock(fFB->fLock);
+@@ -505,7 +599,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			break;
+ 		}
+ 		memcpy(rec, args->structureInput, sizeof(rec));
+-		fFB->swap(rec);
++		fFB->swap(rec, fTask);
+ 		break;
+ 	}
+ 	case kSweetFBGetID:
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..7aad45b 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -27,7 +27,7 @@
+  */
+ #include "SweetSurface.h"
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && !SWEET_APPLE_IOSURFACE
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..d0a32c7 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -9,8 +9,9 @@
+ #define _SWEET_SURFACE_H
+ 
+ #include <pexpert/arm64/board_config.h>
++#include "SweetSurfaceMode.h"
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && !SWEET_APPLE_IOSURFACE
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <libkern/c++/OSObject.h>
+diff --git a/iokit/Kernel/arm/SweetSurfaceMode.h b/iokit/Kernel/arm/SweetSurfaceMode.h
+new file mode 100755
+index 0000000..7fa65a0
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetSurfaceMode.h
+@@ -0,0 +1,21 @@
++/*
++ * Build switch for SWEET's IOSurface root.
++ *
++ * SWEET_APPLE_IOSURFACE 0 (default): the kernel carries its own IOSurface
++ * root (SweetSurface.cpp, "IOCoreSurfaceRoot") and the display driver
++ * (SweetFramebuffer.cpp, AppleCLCD) reads the surfaces from it.
++ *
++ * SWEET_APPLE_IOSURFACE 1: SweetSurface is left out. The iOS userland talks
++ * to Apple's own IOSurface kext (macOS 13.5, IOSurface 336.60.1, prelinked
++ * into the kernel image by tools/prelink.py), registered under the name
++ * "IOCoreSurfaceRoot". AppleCLCD stays in the kernel and reaches the kext
++ * through SweetAppleSurface.cpp (a table of kext functions the prelinker
++ * fills in). xnu/patches-opt/ holds the patch that sets this to 1; the xnu
++ * workflow applies it with the apple_iosurface input.
++ */
++#ifndef _SWEET_SURFACE_MODE_H
++#define _SWEET_SURFACE_MODE_H
++
++#define SWEET_APPLE_IOSURFACE 0
++
++#endif /* _SWEET_SURFACE_MODE_H */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 479ed79..a62af03 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -32,6 +32,8 @@
+  * Version 2.0.
+  */
+ 
++#include "Kernel/arm/SweetSurfaceMode.h"
++
+ const char * gIOKernelConfigTables =
+     "("
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -57,11 +59,13 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOWatchdog;"
+     "   },"
++#if !SWEET_APPLE_IOSURFACE
+     "   {"
+     "     'IOClass'         = IOCoreSurfaceRoot;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+     "   },"
++#endif
+     "   {"
+     "     'IOClass'         = AppleCLCD;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 88b23ce..e5d7078 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -14,6 +14,7 @@ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitc
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetAppleSurface.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp

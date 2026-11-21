@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      apple_iosurface:
+        description: SWEET_APPLE_IOSURFACE=1, SweetSurface left out (iOS 16 on Apple's IOSurface kext, prelinked afterwards)
+        default: "false"
   push:
     branches: [main]
     paths:
@@ -31,6 +34,7 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  APPLE_IOSURFACE: ${{ inputs.apple_iosurface || 'false' }}
 
 jobs:
   build:
@@ -48,6 +52,11 @@ jobs:
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          # 0105 carries the build switch (SweetSurfaceMode.h); the input flips it
+          if [ "$APPLE_IOSURFACE" = "true" ]; then
+            sed -i '' 's/^+#define SWEET_APPLE_IOSURFACE 0$/+#define SWEET_APPLE_IOSURFACE 1/' dxb/patches/0105-sweet-apple-iosurface.patch
+            test "$(grep -c '^+#define SWEET_APPLE_IOSURFACE 1$' dxb/patches/0105-sweet-apple-iosurface.patch)" = 1
+          fi
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
@@ -119,6 +128,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel
+          name: ${{ env.APPLE_IOSURFACE == 'true' && 'xnu-kernel-apple-iosurface' || 'xnu-kernel' }}
           path: out/
           if-no-files-found: warn
