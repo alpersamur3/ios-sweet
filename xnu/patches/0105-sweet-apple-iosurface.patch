@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/SweetAppleSurface.cpp b/iokit/Kernel/arm/SweetAppleSurface.cpp
 new file mode 100755
-index 0000000..e83f5e1
+index 0000000..db39695
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAppleSurface.cpp
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,239 @@
 +/*
 + * Kernel-side access to Apple's IOSurface kext (see SweetAppleSurface.h).
 + *
@@ -108,9 +108,14 @@ index 0000000..e83f5e1
 +static uintptr_t
 +sweet_isurf_map(IOMemoryDescriptor *md)
 +{
++	static unsigned logged;
 +	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, md);
 +	if (buffer != NULL) {
-+		return (uintptr_t)buffer->getBytesNoCopy();
++		/* A pageable buffer has no kernel address of its own (0): map it below. */
++		void *bytes = buffer->getBytesNoCopy();
++		if (bytes != NULL) {
++			return (uintptr_t)bytes;
++		}
 +	}
 +	for (unsigned i = 0; i < SWEET_ISURF_MAPS; i++) {
 +		if (sweet_isurf_maps[i].md == md) {
@@ -118,6 +123,12 @@ index 0000000..e83f5e1
 +		}
 +	}
 +	IOMemoryMap *map = md->map(kIOMapDefaultCache);
++	if (logged++ < 8) {
++		IOLog("SWEET FB: surface memory %p (%s, %llu bytes) mapped at 0x%llx\n", md,
++		    buffer != NULL ? "buffer" : md->getMetaClass()->getClassName(),
++		    (unsigned long long)md->getLength(),
++		    (unsigned long long)(map != NULL ? map->getVirtualAddress() : 0));
++	}
 +	if (map == NULL) {
 +		return 0;
 +	}
